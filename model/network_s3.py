@@ -110,8 +110,7 @@ class BandSelectBlock(nn.Module):
 
         weight_matrix = torch.stack(C_weights, dim=1)  # [B, features_num, C]
         feature_maps = torch.stack(feature_maps, dim=1) # [B, features_num, C, H, W]
-        # print("weight_matrix", weight_matrix.shape)
-        # print("feature_maps", feature_maps.shape)
+
         # 对每个特征逐通道加权
         output = weight_matrix.unsqueeze(-1).unsqueeze(-1) * feature_maps  # [B, features_num, C, H, W]
 
@@ -124,269 +123,78 @@ class BandSelectBlock(nn.Module):
         return output
 
 
-########################## double_U_net_skip ############################
 
-def double_U_net_skip(Out_fhsi,Out_fmsi,args, init_type='kaiming', init_gain=0.02,initializer=True ):
-    
-    net = double_u_net_skip(Out_fhsi,Out_fmsi,args)
 
-    return init_net(net,args.device, init_type, init_gain,initializer)
-
-class double_u_net_skip(nn.Module):
-    def __init__(self,Out_fhsi,Out_fmsi,args): 
-
+# 简化版Transformer分支
+class SimpleSwinTransformerBlock(nn.Module):
+    def __init__(self, in_ch, embed_dim=64, num_layers=4):
         super().__init__()
+        self.proj = nn.Conv2d(in_ch, embed_dim, 1)
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim, 3, padding=1, groups=4),
+                nn.BatchNorm2d(embed_dim),
+                nn.GELU(),
+                nn.Conv2d(embed_dim, embed_dim, 1),
+                nn.GELU()
+            ) for _ in range(num_layers)
+        ])
+        self.out_proj = nn.Conv2d(embed_dim, in_ch, 1)
 
+    def forward(self, x):
+        x = self.proj(x)    # [B, C, H, W]
+        for layer in self.layers:
+            x = x + layer(x)    # [B, C, H, W]
+        x = self.out_proj(x)    # [B, C, H, W]
+        return x
 
-        self.band=args.band
-        hidden_dim = self.band // 2
-        #self.fusion=fusion
-        self.Out_fhsi=Out_fhsi
-        self.Out_fmsi=Out_fmsi
-        self.scale=[
-                              (  self.Out_fhsi.shape[2],self.Out_fhsi.shape[3]  ),
-                              (  int(self.Out_fhsi.shape[2]/2),int(self.Out_fhsi.shape[3]/2)  ),
-                              (  int(self.Out_fhsi.shape[2]/4), int(self.Out_fhsi.shape[3]/4) )
-                              ]
-        print(self.scale)
-       
-        
-        
-        '''for out_fhsi'''
-        self.ex1=nn.Sequential(
-        nn.Conv2d(self.Out_fhsi.shape[1],self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True) nn.ReLU(inplace=True) 
-                                )
-        
-        self.ex2=nn.Sequential(
-        nn.Conv2d(self.band,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
+# U-Net分支（可复用你原有的 double_u_net_skip 单分支部分/简化版U-Net）
+class SimpleUNet(nn.Module):
+    def __init__(self, in_ch, base_ch=64):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, 3, padding=1), nn.ReLU())
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch*2, 3, padding=1), nn.ReLU())
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(base_ch*2, base_ch*4, 3, padding=1), nn.ReLU())
+        self.pool = nn.MaxPool2d(2)
+        self.up2 = nn.ConvTranspose2d(base_ch*4, base_ch*2, 2, stride=2)
+        self.up1 = nn.ConvTranspose2d(base_ch*2, base_ch, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_ch*4, base_ch*2, 3, padding=1), nn.ReLU())
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_ch*2, base_ch, 3, padding=1), nn.ReLU())
+        self.out = nn.Conv2d(base_ch, in_ch, 1)
 
-        self.ex3=nn.Sequential(
-        nn.Conv2d(self.band,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.ex4=nn.Sequential(
-        nn.Conv2d(self.band+2,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.ex5=nn.Sequential(
-        nn.Conv2d(self.band+2,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        #nn.Sigmoid()  #nn.LeakyReLU(0.2, inplace=True)
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True),
-        nn.Conv2d(self.band,self.Out_fhsi.shape[1],kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.Sigmoid()
-                                )
-        
-        self.skip1=nn.Sequential(
-        nn.Conv2d(self.band,2,kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.BatchNorm2d(2),
-        nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.skip2=nn.Sequential(
-        nn.Conv2d(self.band,2,kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.BatchNorm2d(2),
-        nn.LeakyReLU(0.2, inplace=True)
-                                )
-        '''for out_fhsi'''
-        
-        '''for out_fmsi'''
-        
-        self.ex6=nn.Sequential(
-        nn.Conv2d(self.Out_fmsi.shape[1],self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True) nn.ReLU(inplace=True) 
-                                )
-        
-        self.ex7=nn.Sequential(
-        nn.Conv2d(self.band,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        d2 = self.up2(e3)
+        d2 = torch.cat([d2, e2], 1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], 1)
+        d1 = self.dec1(d1)
+        out = self.out(d1)
+        return out
 
-        self.ex8=nn.Sequential(
-        nn.Conv2d(self.band,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.ex9=nn.Sequential(
-        nn.Conv2d(self.band+2,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True) #nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.ex10=nn.Sequential(
-        nn.Conv2d(self.band+2,self.band,kernel_size=(5,5),stride=1,padding=(2,2)) ,
-        #nn.Sigmoid()  #nn.LeakyReLU(0.2, inplace=True)
-        nn.BatchNorm2d(self.band),
-        nn.LeakyReLU(0.2, inplace=True),
-        nn.Conv2d(self.band,self.Out_fmsi.shape[1],kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.Sigmoid()
-                                )
-        
-        self.skip3=nn.Sequential(
-        nn.Conv2d(self.band,2,kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.BatchNorm2d(2),
-        nn.LeakyReLU(0.2, inplace=True)
-                                )
-        
-        self.skip4=nn.Sequential(
-        nn.Conv2d(self.band,2,kernel_size=(1,1),stride=1,padding=(0,0)) ,
-        nn.BatchNorm2d(2),
-        nn.LeakyReLU(0.2, inplace=True)
-                                )
-        '''for out_fmsi'''
+# 新的非对称双流结构
+class DualBranchAsymNet(nn.Module):
+    def __init__(self, in_ch, args):
+        super().__init__()
+        self.trans_branch = SimpleSwinTransformerBlock(in_ch)
+        self.unet_branch = SimpleUNet(in_ch)
+        self.fusion = BandSelectBlock(in_ch, 2) # 2路融合
+        self.out_proj = nn.Conv2d(in_ch, in_ch, 1) # 输出高光谱通道不变
 
-        '''CovBlock和BandSelectBlock集成'''
-        # 多尺度CovBlock（x1、x3、x5三个点）
-        self.covblock1 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        self.covblock3 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        self.covblock5 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        # 多尺度融合
-        self.bandselect_fhsi = BandSelectBlock(self.band, 3)  # 3表示要融合x1,x3,x5
-        self.fused_proj = None  # 占位
-        self.out_fhsi_conv = None  # 如你后面还需要额外1x1卷积，也用None
-        # 下分支
-        self.covblock6 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        self.covblock7 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        self.covblock8 = CovBlock(self.band, self.band, hidden_dim=self.band // 2)
-        self.bandselect_fmsi = BandSelectBlock(self.band, 3)
-        self.fused_proj_fmsi = None
-        self.out_fmsi_conv = None
-        # self.fused_proj = nn.Conv2d(self.band, self.out_ch, 1)  # 其中self.band=fused通道数，self.out_ch=输出通道数
-
-        # 输出1x1卷积
-        # self.out_fhsi_conv = nn.Conv2d(self.band, self.Out_fhsi.shape[1], 1)
-
-    def forward(self, Out_fhsi, Out_fmsi):
-        # print("=== [上分支/Out_fhsi] ===")
-        # 编码
-        x1 = self.ex1(Out_fhsi)  # [B, C, H, W]
-        x2 = nn.AdaptiveAvgPool2d(self.scale[1])(x1)
-        x3 = self.ex2(x2)
-        x4 = nn.AdaptiveAvgPool2d(self.scale[2])(x3)
-        x5 = self.ex3(x4)
-
-        # CovBlock加权
-        x1_w = self.covblock1(rearrange(x1, 'B C H W -> B (H W) C'))
-        x1_w = x1_w.view(x1.shape[0], x1.shape[1], 1, 1)
-        x1_weighted = x1 * x1_w + x1
-        # print("x1_weighted", x1_weighted.shape)
-
-        x3_w = self.covblock3(rearrange(x3, 'B C H W -> B (H W) C'))
-        x3_w = x3_w.view(x3.shape[0], x3.shape[1], 1, 1)
-        x3_weighted = x3 * x3_w + x3
-        # print("x3_weighted", x3_weighted.shape)
-
-        x5_w = self.covblock5(rearrange(x5, 'B C H W -> B (H W) C'))
-        x5_w = x5_w.view(x5.shape[0], x5.shape[1], 1, 1)
-        x5_weighted = x5 * x5_w + x5
-        # print("x5_weighted", x5_weighted.shape)
-
-        # 解码主路
-        up = nn.Upsample(self.scale[1], mode='bilinear')
-        s1 = self.skip1(x3_weighted)
-        x6 = up(x5_weighted)
-        x7 = self.ex4(torch.cat([s1, x6], dim=1))
-        up = nn.Upsample(self.scale[0], mode='bilinear')
-        s2 = self.skip2(x1_weighted)
-        x8 = up(x7)
-        out_fhsi = self.ex5(torch.cat([s2, x8], dim=1))
-        # print("out_fhsi (decode主路输出)", out_fhsi.shape)
-
-        # 多尺度融合（空间对齐）
-        x3_weighted_up = fun.interpolate(x3_weighted, size=self.scale[0], mode='bilinear', align_corners=False)
-        x5_weighted_up = fun.interpolate(x5_weighted, size=self.scale[0], mode='bilinear', align_corners=False)
-
-        fused = self.bandselect_fhsi([x1_weighted, x3_weighted_up, x5_weighted_up])
-        # print("fused (BandSelectBlock融合)", fused.shape)
-
-        # --- 自动初始化 fused_proj ---
-        if self.fused_proj is None:
-            in_ch = fused.shape[1]
-            out_ch = out_fhsi.shape[1]
-            self.fused_proj = nn.Conv2d(in_ch, out_ch, 1).to(fused.device)
-            # print(f"自动初始化fused_proj: Conv2d({in_ch}, {out_ch}, 1)")
-        fused_proj = self.fused_proj(fused)  # [B, out_ch, H, W]
-
-        # --- 你也可以自动初始化 out_fhsi_conv ---
-        if self.out_fhsi_conv is None:
-            out_ch = out_fhsi.shape[1]
-            self.out_fhsi_conv = nn.Conv2d(out_ch, out_ch, 1).to(out_fhsi.device)
-            # print(f"自动初始化out_fhsi_conv: Conv2d({out_ch}, {out_ch}, 1)")
-
-        # 融合最终输出
-        Out_fhsi = self.out_fhsi_conv(fused_proj + out_fhsi)  # [B, out_ch, H, W]
-
-
-        # 下分支编码
-        x9 = self.ex6(Out_fmsi)
-        x10 = nn.AdaptiveAvgPool2d(self.scale[1])(x9)
-        x11 = self.ex7(x10)
-        x12 = nn.AdaptiveAvgPool2d(self.scale[2])(x11)
-        x13 = self.ex8(x12)
-
-        # CovBlock加权
-        x9_w = self.covblock6(rearrange(x9, 'B C H W -> B (H W) C'))
-        x9_w = x9_w.view(x9.shape[0], x9.shape[1], 1, 1)
-        x9_weighted = x9 * x9_w + x9
-        # print("x9_weighted", x9_weighted.shape)
-
-        x11_w = self.covblock7(rearrange(x11, 'B C H W -> B (H W) C'))
-        x11_w = x11_w.view(x11.shape[0], x11.shape[1], 1, 1)
-        x11_weighted = x11 * x11_w + x11
-        # print("x11_weighted", x11_weighted.shape)
-
-        x13_w = self.covblock8(rearrange(x13, 'B C H W -> B (H W) C'))
-        x13_w = x13_w.view(x13.shape[0], x13.shape[1], 1, 1)
-        x13_weighted = x13 * x13_w + x13
-        # print("x13_weighted", x13_weighted.shape)
-
-        # 解码主路
-        up = nn.Upsample(self.scale[1], mode='bilinear')
-        s3 = self.skip3(x11_weighted)
-        x14 = up(x13_weighted)
-        x15 = self.ex9(torch.cat([s3, x14], dim=1))
-        up = nn.Upsample(self.scale[0], mode='bilinear')
-        s4 = self.skip4(x9_weighted)
-        x16 = up(x15)
-        out_fmsi = self.ex10(torch.cat([s4, x16], dim=1))
-        # print("out_fmsi (decode主路输出)", out_fmsi.shape)
-
-        # 多尺度融合（空间对齐）
-        x11_weighted_up = fun.interpolate(x11_weighted, size=self.scale[0], mode='bilinear', align_corners=False)
-        x13_weighted_up = fun.interpolate(x13_weighted, size=self.scale[0], mode='bilinear', align_corners=False)
-        fused_fmsi = self.bandselect_fmsi([x9_weighted, x11_weighted_up, x13_weighted_up])
-        # print("fused_fmsi (BandSelectBlock融合)", fused_fmsi.shape)
-        # 自动初始化1x1卷积
-        if self.fused_proj_fmsi is None:
-            in_ch = fused_fmsi.shape[1]
-            out_ch = out_fmsi.shape[1]
-            self.fused_proj_fmsi = nn.Conv2d(in_ch, out_ch, 1).to(fused_fmsi.device)
-            # print(f"自动初始化fused_proj_fmsi: Conv2d({in_ch}, {out_ch}, 1)")
-        fused_proj_fmsi = self.fused_proj_fmsi(fused_fmsi)
-
-        if self.out_fmsi_conv is None:
-            out_ch = out_fmsi.shape[1]
-            self.out_fmsi_conv = nn.Conv2d(out_ch, out_ch, 1).to(out_fmsi.device)
-            # print(f"自动初始化out_fmsi_conv: Conv2d({out_ch}, {out_ch}, 1)")
-        Out_fmsi = self.out_fmsi_conv(fused_proj_fmsi + out_fmsi)
-        # print("Out_fmsi (最终输出)", Out_fmsi.shape)
-
-        return Out_fhsi, Out_fmsi
-
-########################## double_U_net_skip############################
-
+    def forward(self, x1, x2):
+        feat1 = self.trans_branch(x1)
+        feat2 = self.unet_branch(x2)
+        fused = self.fusion([feat1, feat2])
+        out = self.out_proj(fused)
+        return out, feat1, feat2
 
 
 if __name__ == "__main__":
