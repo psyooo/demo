@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-❗❗❗❗❗❗李嘉鑫 作者微信 BatAug
-空天信息创新研究院20-25直博生，导师高连如
 
-"""
 from datetime import datetime
 
 """
@@ -19,9 +15,18 @@ import scipy
 import torch.nn.functional as fun
 
 from .evaluation import MetricsCal
+from .network_s3_1 import DualBranchAsymNet
+
 
 from .network_s3 import double_U_net_skip
+from model.network_Tucker import MultiStreamHierarchicalTuckerNet
 
+def tucker_rank_reg(model, lambda_rank=1e-2):
+    reg = 0.
+    for block in [model.block1, model.block2]:
+        for g in [block.gate1, block.gate2, block.gate3, block.gateG]:
+            reg = reg + torch.sigmoid(g).abs().sum()
+    return lambda_rank * reg
 
 ''' PSF and SRF 下采样'''
 class PSF_down():
@@ -40,39 +45,52 @@ class SRF_down():
             return output_tensor
         
 class dip():
-    def __init__(self,args,Out_fhsi,Out_fmsi,psf,srf,blind):
-     
-        assert(Out_fhsi.shape == Out_fmsi.shape)
+    # def __init__(self, args, hrhsi_input1, hrhsi_input2, psf, srf, blind,
+    #              abundance_lr=None, endmember_lr=None,
+    #              abundance_hr=None, endmember_hr=None):
+    def __init__(self,args,hrhsi_input1,hrhsi_input2,psf,srf,blind):
+        super().__init__()
+        # assert(hrhsi_input1.shape == hrhsi_input2.shape)
         
         #获取SRF and PSF
         
-        self.Out_fhsi=Out_fhsi
-        self.Out_fmsi=Out_fmsi
+        self.hrhsi_input1=hrhsi_input1
+        self.hrhsi_input2=hrhsi_input2
         
         self.args=args
         
         self.hr_msi=blind.tensor_hr_msi #四维
         self.lr_hsi=blind.tensor_lr_hsi #四维
         self.gt=blind.gt #三维
-        
+
+        # # 物理先验
+        # self.abundance_lr = abundance_lr  # [B, n_end, h, w] from Lr-HSI
+        # self.endmember_lr = endmember_lr  # [1, C, n_end]
+        # self.abundance_hr = abundance_hr  # [B, n_end, H, W] from Hr-MSI
+        # self.endmember_hr = endmember_hr  # [1, c, n_end]
+        #
         psf_est = np.reshape(psf, newshape=(1, 1, self.args.scale_factor, self.args.scale_factor)) #1 1 ratio ratio 大小的tensor
         self.psf_est = torch.tensor(psf_est).to(self.args.device).float()
         srf_est = np.reshape(srf.T, newshape=(srf.shape[1], srf.shape[0], 1, 1)) #self.srf.T 有一个T转置 (8, 191, 1, 1)
         self.srf_est = torch.tensor(srf_est).to(self.args.device).float()             # ms_band hs_bands 1 1 的tensor torch.Size([8, 191, 1, 1])
-        
+
         self.psf_down=PSF_down() #__call__(self, input_tensor, psf, ratio):
         self.srf_down=SRF_down() #__call__(self, input_tensor, srf):
-            
+
         self.noise1 = self.get_noise(self.gt.shape[2],(self.gt.shape[0],self.gt.shape[1])).to(self.args.device).float()
         self.noise2 = self.get_noise(self.gt.shape[2],(self.gt.shape[0],self.gt.shape[1])).to(self.args.device).float()
+        #
+        # # 网络结构：复杂多分支物理门控融合
+        # in_ch = self.lr_hsi_fused.shape[1]
+        # n_end = self.abundance_lr.shape[1] if self.abundance_lr is not None else 4
+        # self.net = MultiBranchNet(in_ch, n_endmember=n_end)
+        self.net = DualBranchAsymNet(hrhsi_input1.shape[1], self.args).to(self.args.device)
 
-        self.net=double_U_net_skip(Out_fhsi,Out_fmsi,self.args)
-        
-        
         def lambda_rule(epoch):
             lr_l = 1.0 - max(0, epoch +  1 - self.args.niter3_dip) / float(self.args.niter_decay3_dip + 1)
             return lr_l
-        
+
+
         self.optimizer=optim.Adam(self.net.parameters(), lr=self.args.lr_stage3_dip)
         self.scheduler=lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda_rule)
         
@@ -112,102 +130,97 @@ class dip():
     
             
             return net_input
-    
+
+
     def train(self):
-        flag_best_fhsi=[11,0,'data',0] #第一个是SAM，第二个是PSNR,第三个为恢复的图像,第四个是保存最佳结果对应的epoch
-        flag_best_fmsi=[11,0,'data',0]
+        flag_best_1=[10,0,'data',0] #第一个是SAM，第二个是PSNR,第三个为恢复的图像,第四个是保存最佳结果对应的epoch
+        flag_best_2=[10,0,'data',0]
 
         L1Loss = nn.L1Loss(reduction='mean')
 
-        # epoch_list = []
-        # l1_log_fhsi, sam_log_fhsi = [], []
-        # l1_log_fmsi, sam_log_fmsi = [], []
-
-        epoch_list = []
-        sam_fhsi_log, psnr_fhsi_log = [], []
-        sam_fmsi_log, psnr_fmsi_log = [], []
 
         for epoch in range(1, self.args.niter3_dip + self.args.niter_decay3_dip + 1):
         
             
             self.optimizer.zero_grad()  #清空梯度
-            
-            self.hrhsi_fhsi,self.hrhsi_fmsi=self.net(self.Out_fhsi,self.Out_fmsi)
+            self.hrhsi_final, self.hrhsi_trans, self.hrhsi_unet = self.net(self.hrhsi_input1, self.hrhsi_input2)
+
+
 
             ''' generate hr_msi_est '''
             #print(self.hrhsi_est.shape)
-            self.hr_msi_hrhsi_fhsi = self.srf_down(self.hrhsi_fhsi,self.srf_est)    # 光谱退化
-            self.hr_msi_hrhsi_fmsi = self.srf_down(self.hrhsi_fmsi,self.srf_est)
-            
-            #print("self.hr_msi_from_hrhsi shape:{}".format(self.hr_msi_from_hrhsi.shape))
+            self.hr_msi_hrhsi_trans = self.srf_down(self.hrhsi_trans,self.srf_est)    # 光谱退化
+            self.hr_msi_hrhsi_unet = self.srf_down(self.hrhsi_unet,self.srf_est)
 
             ''' generate lr_hsi_est '''
-            self.lr_hsi_hrhsi_fhsi = self.psf_down(self.hrhsi_fhsi, self.psf_est, self.args.scale_factor)   # 空间退化
-            self.lr_hsi_hrhsi_fmsi = self.psf_down(self.hrhsi_fmsi, self.psf_est, self.args.scale_factor)
+            self.lr_hsi_hrhsi_trans = self.psf_down(self.hrhsi_trans, self.psf_est, self.args.scale_factor)   # 空间退化
+            self.lr_hsi_hrhsi_unet = self.psf_down(self.hrhsi_unet, self.psf_est, self.args.scale_factor)
             
-            #print("self.lr_hsi_from_hrhsi shape:{}".format(self.lr_hsi_from_hrhsi.shape))
+
 
 
             # Y--->lr_hsi，Z--->hr_msi
-            # 融合图像空间退化--->lr_hsi_hrhsi_fhsi，融合图像光谱退化--->hr_msi_hrhsi_fmsi
-            loss_fhsi= L1Loss(self.hr_msi,self.hr_msi_hrhsi_fhsi) + L1Loss(self.lr_hsi,self.lr_hsi_hrhsi_fhsi)      # 空间退化+光谱退化
-            loss_fmsi= L1Loss(self.hr_msi,self.hr_msi_hrhsi_fmsi) + L1Loss(self.lr_hsi,self.lr_hsi_hrhsi_fmsi)
+            # 融合图像空间退化--->lr_hsi_hrhsi_trans，融合图像光谱退化--->hr_msi_hrhsi_unet
+            loss_fhsi= L1Loss(self.hr_msi,self.hr_msi_hrhsi_trans) + L1Loss(self.lr_hsi,self.lr_hsi_hrhsi_trans)      # 空间退化+光谱退化
+            loss_fmsi= L1Loss(self.hr_msi,self.hr_msi_hrhsi_unet) + L1Loss(self.lr_hsi,self.lr_hsi_hrhsi_unet)
             loss=loss_fhsi+loss_fmsi
-            loss.backward()
-            
-            
-            self.optimizer.step()
-                
-            
-            self.scheduler.step()
-            
-            
-            if epoch % 50 ==0:
 
+            # === NEW: 加入Tucker秩正则 ===
+            # loss += tucker_rank_reg(self.net, lambda_rank=getattr(self.args, 'lambda_rank', 1e-5))
+
+            loss.backward()
+            self.optimizer.step()
+            self.scheduler.step()
+
+            if epoch % 50 ==0:
                 with torch.no_grad():
-                    
                     print("___________________stage-3__________________________")
                     print('epoch:{} lr:{}'.format(epoch,self.optimizer.param_groups[0]['lr']))
                     print('************')
-                    
+                    # self.print_tucker_ranks()
                     
                     #转为W H C的numpy 方便计算指标
                     #hrmsi
                     hr_msi_numpy=self.hr_msi.data.cpu().detach().numpy()[0].transpose(1,2,0)
-                    hr_msi_estfhsi_numpy=self.hr_msi_hrhsi_fhsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
-                    hr_msi_estfmsi_numpy=self.hr_msi_hrhsi_fmsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    hr_msi_est_ftrans_numpy=self.hr_msi_hrhsi_trans.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    hr_msi_est_funet_numpy=self.hr_msi_hrhsi_unet.data.cpu().detach().numpy()[0].transpose(1,2,0)
                     
                     #lrhsi
                     lr_hsi_numpy=self.lr_hsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
-                    lr_hsi_estfhsi_numpy=self.lr_hsi_hrhsi_fhsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
-                    lr_hsi_estfmsi_numpy=self.lr_hsi_hrhsi_fmsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    lr_hsi_est_ftrans_numpy=self.lr_hsi_hrhsi_trans.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    lr_hsi_est_funet_numpy=self.lr_hsi_hrhsi_unet.data.cpu().detach().numpy()[0].transpose(1,2,0)
 
                     #gt
-                    hrhsi_est_numpy_fhsi=self.hrhsi_fhsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
-                    hrhsi_est_numpy_fmsi=self.hrhsi_fmsi.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    hrhsi_est_numpy_ftrans=self.hrhsi_trans.data.cpu().detach().numpy()[0].transpose(1,2,0)
+                    hrhsi_est_numpy_funet=self.hrhsi_unet.data.cpu().detach().numpy()[0].transpose(1,2,0)
+
+                    # final
+                    hrhsi_est_numpy_final=self.hrhsi_final.data.cpu().detach().numpy()[0].transpose(1,2,0)
                     #self.gt
+
+
                 
-                    ''' for fhsi'''
+                    ''' for ftrans'''
                     
                     #学习到的lrhsi与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(lr_hsi_numpy,lr_hsi_estfhsi_numpy, self.args.scale_factor)
-                    L1=np.mean( np.abs( lr_hsi_numpy - lr_hsi_estfhsi_numpy ))
-                    information1="生成lrhsi_fhsi与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(lr_hsi_numpy,lr_hsi_est_ftrans_numpy, self.args.scale_factor)
+                    L1=np.mean( np.abs( lr_hsi_numpy - lr_hsi_est_ftrans_numpy ))
+                    information1="生成lrhsi_ftrans与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information1) #监控训练过程
                     print('************')
                 
                     #学习到的hrmsi与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(hr_msi_numpy,hr_msi_estfhsi_numpy, self.args.scale_factor)
-                    L1=np.mean( np.abs( hr_msi_numpy - hr_msi_estfhsi_numpy ))
-                    information2="生成hrmsi_fhsi与目标hrmsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(hr_msi_numpy,hr_msi_est_ftrans_numpy, self.args.scale_factor)
+                    L1=np.mean( np.abs( hr_msi_numpy - hr_msi_est_ftrans_numpy ))
+                    information2="生成hrmsi_ftrans与目标hrmsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information2) #监控训练过程
                     print('************')
                     
                     
                     #学习到的gt与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(self.gt,hrhsi_est_numpy_fhsi, self.args.scale_factor)
-                    L1=np.mean( np.abs( self.gt - hrhsi_est_numpy_fhsi ))
-                    information3="生成hrhsi_est_fhsi与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(self.gt,hrhsi_est_numpy_ftrans, self.args.scale_factor)
+                    L1=np.mean( np.abs( self.gt - hrhsi_est_numpy_ftrans ))
+                    information3="生成hrhsi_est_ftrans与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information3) #监控训练过程
                     print('************')
                    
@@ -225,40 +238,40 @@ class dip():
                         opt_file.write('\n')
                         
                     
-                    if sam < flag_best_fhsi[0] and psnr > flag_best_fhsi[1]:         
+                    if sam < flag_best_1[0] and psnr > flag_best_1[1]:
                   
-                        flag_best_fhsi[0]=sam
-                        flag_best_fhsi[1]=psnr
-                        flag_best_fhsi[2]=self.hrhsi_fhsi #保存四维tensor
-                        flag_best_fhsi[3]=epoch
+                        flag_best_1[0]=sam
+                        flag_best_1[1]=psnr
+                        flag_best_1[2]=self.hrhsi_trans #保存四维tensor
+                        flag_best_1[3]=epoch
                         
                         information_a=information1
                         information_b=information2
                         information_c=information3
                                                
-                    ''' for fhsi'''
+                    ''' for ftrans'''
                     
                     print('--------------------------------')
                     
-                    ''' for fmsi'''
+                    ''' for funet'''
                     #学习到的lrhsi与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(lr_hsi_numpy,lr_hsi_estfmsi_numpy, self.args.scale_factor)
-                    L1=np.mean( np.abs( lr_hsi_numpy - lr_hsi_estfmsi_numpy ))
-                    information1="生成lrhsi_fmsi与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(lr_hsi_numpy,lr_hsi_est_funet_numpy, self.args.scale_factor)
+                    L1=np.mean( np.abs( lr_hsi_numpy - lr_hsi_est_funet_numpy ))
+                    information1="生成lrhsi_funet与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information1) #监控训练过程
                     print('************')
                 
                     #学习到的hrmsi与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(hr_msi_numpy,hr_msi_estfmsi_numpy, self.args.scale_factor)
-                    L1=np.mean( np.abs( hr_msi_numpy - hr_msi_estfmsi_numpy ))
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(hr_msi_numpy,hr_msi_est_funet_numpy, self.args.scale_factor)
+                    L1=np.mean( np.abs( hr_msi_numpy - hr_msi_est_funet_numpy ))
                     information2="生成hrmsi_fmsi与目标hrmsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information2) #监控训练过程
                     print('************')
                     
                     
                     #学习到的gt与真值
-                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(self.gt,hrhsi_est_numpy_fmsi, self.args.scale_factor)
-                    L1=np.mean( np.abs( self.gt - hrhsi_est_numpy_fmsi ))
+                    sam,psnr,ergas,cc,rmse,Ssim,Uqi=MetricsCal(self.gt,hrhsi_est_numpy_funet, self.args.scale_factor)
+                    L1=np.mean( np.abs( self.gt - hrhsi_est_numpy_funet ))
                     information3="生成hrhsi_est_fmsi与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1,sam,psnr,ergas,cc,rmse,Ssim,Uqi)
                     print(information3) #监控训练过程
                     print('************')
@@ -278,14 +291,14 @@ class dip():
                         opt_file.write(information3)
                         opt_file.write('\n')
                         #opt_file.write('————————————————————————————————')
-                    print(type(flag_best_fhsi[2]))
-                    print(flag_best_fhsi[2])
-                    if sam < flag_best_fmsi[0] and psnr > flag_best_fmsi[1]:         
+                    # print(type(flag_best_1[2]))
+                    # print(flag_best_1[2])
+                    if sam < flag_best_2[0] and psnr > flag_best_2[1]:
                     
-                        flag_best_fmsi[0]=sam
-                        flag_best_fmsi[1]=psnr
-                        flag_best_fmsi[2]=self.hrhsi_fmsi #保存四维tensor
-                        flag_best_fmsi[3]=epoch
+                        flag_best_2[0]=sam
+                        flag_best_2[1]=psnr
+                        flag_best_2[2]=self.hrhsi_unet #保存四维tensor
+                        flag_best_2[3]=epoch
                         
                         information_d=information1
                         information_e=information2
@@ -295,30 +308,30 @@ class dip():
 
 
         #保存最好的结果
-        # scipy.io.savemat(os.path.join(self.args.expr_dir, 'Out_fhsi_S3.mat'), {'Out':flag_best_fhsi[2].data.cpu().numpy()[0].transpose(1,2,0)})
-        # scipy.io.savemat(os.path.join(self.args.expr_dir, 'Out_fmsi_S3.mat'), {'Out':flag_best_fmsi[2].data.cpu().numpy()[0].transpose(1,2,0)})
+        # scipy.io.savemat(os.path.join(self.args.expr_dir, 'Out_fhsi_S3.mat'), {'Out':flag_best_1[2].data.cpu().numpy()[0].transpose(1,2,0)})
+        # scipy.io.savemat(os.path.join(self.args.expr_dir, 'Out_fmsi_S3.mat'), {'Out':flag_best_2[2].data.cpu().numpy()[0].transpose(1,2,0)})
 
-        if isinstance(flag_best_fhsi[2], torch.Tensor):
+        if isinstance(flag_best_1[2], torch.Tensor):
             scipy.io.savemat(
-                os.path.join(self.args.expr_dir, 'Out_fhsi_S3.mat'),
-                {'Out': flag_best_fhsi[2].data.cpu().numpy()[0].transpose(1, 2, 0)}
+                os.path.join(self.args.expr_dir, 'hrhsi_1_S3.mat'),
+                {'Out': flag_best_1[2].data.cpu().numpy()[0].transpose(1, 2, 0)}
             )
         else:
-            print("Warning: flag_best_fhsi[2] is not a tensor, skipping save.")
-        if isinstance(flag_best_fmsi[2], torch.Tensor):
+            print("Warning: flag_best_1[2] is not a tensor, skipping save.")
+        if isinstance(flag_best_2[2], torch.Tensor):
             scipy.io.savemat(
-                os.path.join(self.args.expr_dir, 'Out_fmsi_S3.mat'),
-                {'Out': flag_best_fmsi[2].data.cpu().numpy()[0].transpose(1, 2, 0)}
+                os.path.join(self.args.expr_dir, 'hrhsi_2_S3.mat'),
+                {'Out': flag_best_2[2].data.cpu().numpy()[0].transpose(1, 2, 0)}
             )
         else:
-            print("Warning: flag_best_fmsi[2] is not a tensor, skipping save.")
+            print("Warning: flag_best_2[2] is not a tensor, skipping save.")
         #保存精度
         file_name = os.path.join(self.args.expr_dir, 'Stage3.txt')
         with open(file_name, 'a') as opt_file:
             
             opt_file.write('————————————最终结果————————————')
             opt_file.write('\n')
-            opt_file.write('epoch_fhsi_best:{}'.format(flag_best_fhsi[3]))
+            opt_file.write('epoch_fhsi_best:{}'.format(flag_best_1[3]))
             opt_file.write('\n')
             opt_file.write(information_a)
             opt_file.write('\n')
@@ -326,7 +339,7 @@ class dip():
             opt_file.write('\n')
             opt_file.write(information_c)
             opt_file.write('\n')
-            opt_file.write('epoch_fmsi_best:{}'.format(flag_best_fmsi[3]))
+            opt_file.write('epoch_fmsi_best:{}'.format(flag_best_2[3]))
             opt_file.write('\n')
             opt_file.write(information_d)
             opt_file.write('\n')
@@ -335,10 +348,7 @@ class dip():
             opt_file.write(information_f)
 
 
-        return flag_best_fhsi[2] ,flag_best_fmsi[2]
-    
-
-        
+        return flag_best_1[2],flag_best_2[2]
         
 if __name__ == "__main__":
     
