@@ -176,89 +176,79 @@ class BandSelectBlock(nn.Module):
         return output
 
 
-from einops.layers.torch import Rearrange
+# ============================== 空洞卷积模块定义 =================================
+class DilatedConvBlock(nn.Module):
+    def __init__(self, in_ch, num_layers=3, dilation_rates=[1, 2, 4]):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            dilation = dilation_rates[i % len(dilation_rates)]  # 循环使用空洞率
+            layers.extend([
+                nn.Conv2d(in_ch, in_ch, 3, padding=dilation, dilation=dilation),  # 空洞卷积
+                nn.BatchNorm2d(in_ch),
+                nn.ReLU(inplace=True)
+            ])
+        self.layers = nn.Sequential(*layers)
+        self.out_proj = nn.Conv2d(in_ch, in_ch, 1)
 
-# 改进后的简化版Transformer分支
-class SimpleSwinTransformerBlock(nn.Module):
-    def __init__(self, in_ch, embed_dim=32, num_layers=4, num_heads=4):
+    def forward(self, x):
+        residual = x
+        x = self.layers(x)
+        x = self.out_proj(x)
+        return x + residual
+# ============================== 新增模块定义结束 =================================
+
+# ============================== 自定义轻量级卷积网络 ============================
+# 优化后的轻量级卷积网络块
+class ResidualDepthwiseBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super().__init__()
+        self.depthwise_conv = DepthwiseSeparableConv(in_channels, out_channels, kernel_size, padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.SiLU()  # 使用SiLU激活函数
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        x = self.depthwise_conv(x)
+        x = self.bn(x)
+        x = self.activation(x)
+
+        return x
+
+
+# 优化后的轻量级卷积网络
+class OptimizedLightweightConvBlock(nn.Module):
+    def __init__(self, in_ch, embed_dim=32, num_layers=4):
         super().__init__()
         self.proj = nn.Conv2d(in_ch, embed_dim, 1)
         self.layers = nn.ModuleList([
-            nn.Sequential(
-                # 保持张量为[B, S, C]格式，对C维度进行LayerNorm
-                nn.LayerNorm(embed_dim),
-                # 将张量转换为[B, C, S]用于Conv1d
-                Rearrange('b s c -> b c s'),
-                nn.Conv1d(embed_dim, embed_dim, 3, padding=1, groups=4),
-                nn.BatchNorm1d(embed_dim),
-                nn.GELU(),
-                nn.Conv1d(embed_dim, embed_dim, 1),
-                nn.GELU(),
-                # 恢复为[B, S, C]格式进行LayerNorm
-                Rearrange('b c s -> b s c'),
-                nn.LayerNorm(embed_dim),
-                # 再次转换为[B, C, S]用于Conv1d
-                Rearrange('b s c -> b c s'),
-                nn.Conv1d(embed_dim, embed_dim, 3, padding=1),
-                nn.BatchNorm1d(embed_dim),
-                nn.GELU(),
-                # 自注意力层保持[B, S, C]格式
-                Rearrange('b c s -> b s c'),
-                MultiHeadSelfAttention(embed_dim, num_heads),
-                nn.GELU()
-            ) for _ in range(num_layers)
+            ResidualDepthwiseBlock(embed_dim, embed_dim)
+            for _ in range(num_layers)
         ])
         self.out_proj = nn.Conv2d(embed_dim, in_ch, 1)
-        # 分块大小
-        self.chunk_size = 16
 
     def forward(self, x):
-        if self.training and x.size(2) * x.size(3) > 10000:  # 只对大输入分块
-            B, C, H, W = x.size()
-            chunks = []
+        x = self.proj(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.out_proj(x)
+        return x
 
-            for i in range(0, H, self.chunk_size):
-                for j in range(0, W, self.chunk_size):
-                    h_end = min(i + self.chunk_size, H)
-                    w_end = min(j + self.chunk_size, W)
 
-                    chunk = x[:, :, i:h_end, j:w_end]
-                    chunk = self.proj(chunk)  # 通道数可能发生变化
+# 用 OptimizedLightweightConvBlock 替换 SimpleSwinTransformerBlock
+class NewNetworkBlock(nn.Module):
+    def __init__(self, in_ch, embed_dim=32, num_layers=4):
+        super().__init__()
+        self.conv_block = OptimizedLightweightConvBlock(in_ch, embed_dim, num_layers)
 
-                    # 展平并处理
-                    chunk = chunk.flatten(2).transpose(1, 2)
-                    for layer in self.layers:
-                        chunk = layer(chunk)
+    def forward(self, x):
+        return self.conv_block(x)
+# ============================== 自定义轻量级卷积网络结束 ============================
 
-                    # 恢复形状
-                    chunk = chunk.transpose(1, 2).view(B, -1, h_end - i, w_end - j)
-                    chunks.append(chunk)
-
-            # 获取 self.proj 输出的通道数
-            proj_C = chunks[0].size(1)
-
-            # 合并分块结果
-            out = torch.zeros((B, proj_C, H, W), device=x.device)  # 使用 proj_C 作为通道数
-            idx = 0
-            for i in range(0, H, self.chunk_size):
-                for j in range(0, W, self.chunk_size):
-                    h_end = min(i + self.chunk_size, H)
-                    w_end = min(j + self.chunk_size, W)
-                    out[:, :, i:h_end, j:w_end] = chunks[idx]
-                    idx += 1
-
-            x = self.out_proj(out)
-            return x
-        else:
-            # 原始处理逻辑
-            x = self.proj(x)
-            B, C, H, W = x.size()
-            x = x.flatten(2).transpose(1, 2)
-            for layer in self.layers:
-                x = layer(x)
-            x = x.transpose(1, 2).view(B, C, H, W)
-            x = self.out_proj(x)
-            return x
 
 # U-Net分支（可复用你原有的 double_u_net_skip 单分支部分/简化版U-Net）
 class SimpleUNet(nn.Module):
@@ -305,7 +295,7 @@ class SimpleUNet(nn.Module):
 class DualBranchAsymNet(nn.Module):
     def __init__(self, in_ch, args):
         super().__init__()
-        self.trans_branch = SimpleSwinTransformerBlock(in_ch)
+        self.trans_branch = NewNetworkBlock(in_ch)
         self.unet_branch = SimpleUNet(in_ch)
         self.fusion = BandSelectBlock(in_ch, 2) # 2路融合
         self.out_proj = nn.Conv2d(in_ch, in_ch, 1) # 输出高光谱通道不变
