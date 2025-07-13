@@ -249,6 +249,49 @@ class NewNetworkBlock(nn.Module):
         return self.conv_block(x)
 # ============================== 自定义轻量级卷积网络结束 ============================
 
+# ============================== 新增网络结构定义 ==================================
+from einops import rearrange
+class TuckerDecompositionBlock(nn.Module):
+    def __init__(self, in_ch, rank):
+        super().__init__()
+        self.in_ch = in_ch
+        self.rank = rank
+
+        # 初始化因子矩阵
+        self.factor_matrix_1 = nn.Parameter(torch.randn(in_ch, rank))
+        self.factor_matrix_2 = nn.Parameter(torch.randn(in_ch, rank))
+        self.factor_matrix_3 = nn.Parameter(torch.randn(in_ch, rank))
+
+        # 初始化核心张量
+        self.core_tensor = nn.Parameter(torch.randn(rank, rank, rank))
+
+        self.out_proj = nn.Conv2d(in_ch, in_ch, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+
+        # 张量展开
+        x_flat = rearrange(x, 'b c h w -> b c (h w)')
+
+        # Tucker分解
+        tucker_output = einsum('bci, ir, jr, kr, cr, cr, cr -> bco',
+                               x_flat,
+                               self.factor_matrix_1,
+                               self.factor_matrix_2,
+                               self.factor_matrix_3,
+                               self.core_tensor,
+                               self.factor_matrix_1,
+                               self.factor_matrix_2)
+
+        # 恢复形状
+        tucker_output = rearrange(tucker_output, 'b c (h w) -> b c h w', h=H, w=W)
+
+        # 输出投影
+        out = self.out_proj(tucker_output)
+        return out
+
+# ============================== 新增网络结构定义结束 ===============================
+
 
 # U-Net分支（可复用你原有的 double_u_net_skip 单分支部分/简化版U-Net）
 class SimpleUNet(nn.Module):
@@ -295,7 +338,7 @@ class SimpleUNet(nn.Module):
 class DualBranchAsymNet(nn.Module):
     def __init__(self, in_ch, args):
         super().__init__()
-        self.trans_branch = NewNetworkBlock(in_ch)
+        self.trans_branch = DilatedConvBlock(in_ch)
         self.unet_branch = SimpleUNet(in_ch)
         self.fusion = BandSelectBlock(in_ch, 2) # 2路融合
         self.out_proj = nn.Conv2d(in_ch, in_ch, 1) # 输出高光谱通道不变
