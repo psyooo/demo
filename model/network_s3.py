@@ -52,60 +52,6 @@ def init_net(net,device, init_type, init_gain,initializer):
         print('Spectral_downsample with default initialize')
     return net
 
-# 新增模块定义
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x):
-        batch_size, seq_len, _ = x.size()
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_probs, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
-        return self.out_proj(attn_output)
-
-class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, padding=0):
-        super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, groups=in_channels)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        return x
-
-class AttentionGate(nn.Module):
-    def __init__(self, in_channels, gating_channels):
-        super().__init__()
-        self.theta = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
-        self.phi = nn.Conv2d(gating_channels, in_channels // 2, kernel_size=1)
-        self.psi = nn.Conv2d(in_channels // 2, 1, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x, g):
-        theta_x = self.theta(x)
-        phi_g = self.phi(g)
-        # 调整 phi_g 的形状，使其与 theta_x 一致
-        phi_g = F.interpolate(phi_g, size=theta_x.shape[2:], mode='bilinear', align_corners=True)
-        f = F.relu(theta_x + phi_g)
-        psi_f = self.psi(f)
-        attention = self.sigmoid(psi_f)
-        return attention * x
 
 # 定义 CovBlock 和 BandSelectBlock 类
 class CovBlock(nn.Module):
@@ -176,6 +122,39 @@ class BandSelectBlock(nn.Module):
         return output
 
 
+
+
+# 定义深度可分离卷积模块
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=padding, groups=in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+# 定义 AttentionGate 类
+class AttentionGate(nn.Module):
+    def __init__(self, in_channels, gating_channels):
+        super().__init__()
+        self.theta = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        self.phi = nn.Conv2d(gating_channels, in_channels // 2, kernel_size=1)
+        self.psi = nn.Conv2d(in_channels // 2, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, g):
+        theta_x = self.theta(x)
+        phi_g = self.phi(g)
+        # 调整 phi_g 的形状，使其与 theta_x 一致
+        phi_g = F.interpolate(phi_g, size=theta_x.shape[2:], mode='bilinear', align_corners=True)
+        f = F.relu(theta_x + phi_g)
+        psi_f = self.psi(f)
+        attention = self.sigmoid(psi_f)
+        return attention * x
+
 # ============================== 空洞卷积模块定义 =================================
 class DilatedConvBlock(nn.Module):
     def __init__(self, in_ch, num_layers=3, dilation_rates=[1, 2, 4]):
@@ -196,101 +175,8 @@ class DilatedConvBlock(nn.Module):
         x = self.layers(x)
         x = self.out_proj(x)
         return x + residual
-# ============================== 新增模块定义结束 =================================
+# ============================== 空洞卷积模块定义结束 =================================
 
-# ============================== 自定义轻量级卷积网络 ============================
-# 优化后的轻量级卷积网络块
-class ResidualDepthwiseBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
-        super().__init__()
-        self.depthwise_conv = DepthwiseSeparableConv(in_channels, out_channels, kernel_size, padding)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.activation = nn.SiLU()  # 使用SiLU激活函数
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.shortcut = nn.Identity()
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-        x = self.depthwise_conv(x)
-        x = self.bn(x)
-        x = self.activation(x)
-
-        return x
-
-
-# 优化后的轻量级卷积网络
-class OptimizedLightweightConvBlock(nn.Module):
-    def __init__(self, in_ch, embed_dim=32, num_layers=4):
-        super().__init__()
-        self.proj = nn.Conv2d(in_ch, embed_dim, 1)
-        self.layers = nn.ModuleList([
-            ResidualDepthwiseBlock(embed_dim, embed_dim)
-            for _ in range(num_layers)
-        ])
-        self.out_proj = nn.Conv2d(embed_dim, in_ch, 1)
-
-    def forward(self, x):
-        x = self.proj(x)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.out_proj(x)
-        return x
-
-
-# 用 OptimizedLightweightConvBlock 替换 SimpleSwinTransformerBlock
-class NewNetworkBlock(nn.Module):
-    def __init__(self, in_ch, embed_dim=32, num_layers=4):
-        super().__init__()
-        self.conv_block = OptimizedLightweightConvBlock(in_ch, embed_dim, num_layers)
-
-    def forward(self, x):
-        return self.conv_block(x)
-# ============================== 自定义轻量级卷积网络结束 ============================
-
-# ============================== 新增网络结构定义 ==================================
-from einops import rearrange
-class TuckerDecompositionBlock(nn.Module):
-    def __init__(self, in_ch, rank):
-        super().__init__()
-        self.in_ch = in_ch
-        self.rank = rank
-
-        # 初始化因子矩阵
-        self.factor_matrix_1 = nn.Parameter(torch.randn(in_ch, rank))
-        self.factor_matrix_2 = nn.Parameter(torch.randn(in_ch, rank))
-        self.factor_matrix_3 = nn.Parameter(torch.randn(in_ch, rank))
-
-        # 初始化核心张量
-        self.core_tensor = nn.Parameter(torch.randn(rank, rank, rank))
-
-        self.out_proj = nn.Conv2d(in_ch, in_ch, 1)
-
-    def forward(self, x):
-        B, C, H, W = x.size()
-
-        # 张量展开
-        x_flat = rearrange(x, 'b c h w -> b c (h w)')
-
-        # Tucker分解
-        tucker_output = einsum('bci, ir, jr, kr, cr, cr, cr -> bco',
-                               x_flat,
-                               self.factor_matrix_1,
-                               self.factor_matrix_2,
-                               self.factor_matrix_3,
-                               self.core_tensor,
-                               self.factor_matrix_1,
-                               self.factor_matrix_2)
-
-        # 恢复形状
-        tucker_output = rearrange(tucker_output, 'b c (h w) -> b c h w', h=H, w=W)
-
-        # 输出投影
-        out = self.out_proj(tucker_output)
-        return out
-
-# ============================== 新增网络结构定义结束 ===============================
 
 
 # U-Net分支（可复用你原有的 double_u_net_skip 单分支部分/简化版U-Net）
@@ -317,20 +203,23 @@ class SimpleUNet(nn.Module):
         self.dec1 = nn.Sequential(
             DepthwiseSeparableConv(base_ch * 2, base_ch, 3, padding=1), nn.ReLU()
         )
+        self.relu = nn.ReLU()
+        self.LReLU = nn.LeakyReLU(0.2)
         self.out = nn.Conv2d(base_ch, in_ch, 1)
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
+        e1 = self.relu(self.enc1(x))
+
+        e2 = self.relu(self.enc2(self.pool(e1)))
+        e3 = self.relu(self.enc3(self.pool(e2)))
         d2 = self.up2(e3)
         e2_attn = self.attn_gate2(e2, e3)
         d2 = torch.cat([d2, e2_attn], 1)
-        d2 = self.dec2(d2)
+        d2 = self.relu(self.dec2(d2))
         d1 = self.up1(d2)
         e1_attn = self.attn_gate1(e1, d2)
         d1 = torch.cat([d1, e1_attn], 1)
-        d1 = self.dec1(d1)
+        d1 = self.relu(self.dec1(d1))
         out = self.out(d1)
         return out
 
@@ -344,11 +233,11 @@ class DualBranchAsymNet(nn.Module):
         self.out_proj = nn.Conv2d(in_ch, in_ch, 1) # 输出高光谱通道不变
 
     def forward(self, x1, x2):
-        feat1 = self.trans_branch(x1)
-        feat2 = self.unet_branch(x2)
-        fused = self.fusion([feat1, feat2])
-        out = self.out_proj(fused)
-        return out, feat1, feat2
+        feat1 = self.trans_branch(x1.clone())
+        feat2 = self.unet_branch(x2.clone())
+        # fused = self.fusion([feat1, feat2])
+        # out = self.out_proj(fused)
+        return feat1, feat2
 
 
 if __name__ == "__main__":
