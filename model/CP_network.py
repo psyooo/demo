@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .network_s3_1 import DilatedConvBlock, SimpleUNet
 
 
 class DoubleConv(nn.Module):
@@ -29,13 +30,10 @@ class Down(nn.Module):
 
     def __init__(self, in_channels, out_channels, use_bn=True):
         super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels, use_bn)
-        )
+        self.avgpool_conv = nn.Sequential(nn.AvgPool2d(2), DoubleConv(in_channels, out_channels, use_bn))
 
     def forward(self, x):
-        return self.maxpool_conv(x)
+        return self.avgpool_conv(x)
 
 
 class Up(nn.Module):
@@ -68,9 +66,10 @@ class OutConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(OutConv, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.Sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return self.conv(x)
+        return self.Sigmoid(self.conv(x))
 
 
 class FRM(nn.Module):
@@ -85,6 +84,9 @@ class FRM(nn.Module):
         self.leaky_relu = nn.LeakyReLU(inplace=False)
 
     def forward(self, x, skip_x):
+        # x, skip_x: [B, C, H, W]，空间可能不一致
+        if x.shape[2:] != skip_x.shape[2:]:
+            x = F.interpolate(x, size=skip_x.shape[2:], mode='bilinear', align_corners=True)
         concat_feat = torch.cat([x, skip_x], dim=1)
         out = self.leaky_relu(self.conv1(concat_feat))
         out = self.leaky_relu(self.conv2(out))
@@ -93,7 +95,6 @@ class FRM(nn.Module):
 
 class MDRMWithCPRecon(nn.Module):
     """改进版 MDRM with CP Reconstruction"""
-
     def __init__(self, in_channels, k=4):
         super(MDRMWithCPRecon, self).__init__()
         self.k = k
@@ -109,6 +110,9 @@ class MDRMWithCPRecon(nn.Module):
 
         # 注意力生成器
         self.U_gen = nn.Conv2d(in_channels, k, kernel_size=1)
+        self.u1_conv = nn.Conv2d(in_channels, in_channels*k, kernel_size=1)
+        self.u2_conv = nn.Conv2d(in_channels, in_channels*k, kernel_size=1)
+        self.u3_conv = nn.Conv2d(in_channels, in_channels*k, kernel_size=1)
         self.softmax = nn.Softmax(dim=-1)
 
         # 重建映射
@@ -123,14 +127,20 @@ class MDRMWithCPRecon(nn.Module):
 
         # 可学习融合权重
         self.alpha = nn.Parameter(torch.tensor(0.5))  # 初始值为0.5
+        self.lambda_weight = nn.Parameter(torch.ones(k))  # [k]
 
         self.leaky_relu = nn.LeakyReLU(inplace=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, frm_feat, other_feat):
         batch, C, H, W = frm_feat.shape
+
         concat_feat = torch.cat([frm_feat, other_feat], dim=1)
         Fm = self.leaky_relu(self.conv3x3(concat_feat))  # [B, C, H, W]
+
+        # print("Fm shape:", Fm.shape)  # 你融合特征的shape
+        # print("u1_conv out shape:", self.u1_conv(Fm).shape)
+        # print("reshape目标：", (batch, C, self.k, H, W))
 
         # ===== 模式1: 通道维度 =====
         mode1 = Fm.permute(0, 2, 3, 1).reshape(batch, H * W, C).permute(0, 2, 1)  # [B, C, H*W]
@@ -156,15 +166,6 @@ class MDRMWithCPRecon(nn.Module):
         feat3 = self.adapter_feat3(feat3)
         U3 = self.softmax(self.U_gen(feat3).squeeze(-1).permute(0, 2, 1))  # [B, H, k]
 
-        # ===== CP重构 =====
-        U1_exp = U1.permute(0, 2, 1).unsqueeze(3).unsqueeze(4)  # [B, k, C, 1, 1]
-        U2_exp = U2.permute(0, 2, 1).unsqueeze(2).unsqueeze(4)  # [B, k, 1, W, 1]
-        U3_exp = U3.permute(0, 2, 1).unsqueeze(2).unsqueeze(3)  # [B, k, 1, 1, H]
-
-        cp_recon = (U1_exp * U2_exp * U3_exp).sum(dim=1)  # [B, C, W, H]
-        cp_recon = cp_recon.permute(0, 1, 3, 2)  # → [B, C, H, W]
-        cp_recon = self.recon_conv(cp_recon)
-
         # ===== 空间注意力 =====
         spatial_att = self.sigmoid(self.spatial_conv(torch.matmul(U3, U2.transpose(1, 2)).unsqueeze(1)))  # [B, 1, H, W]
 
@@ -188,11 +189,75 @@ class MDRMWithCPRecon(nn.Module):
 
         spectral_att = self.sigmoid(spectral_att) # [B, 1, C]
 
-        W = spectral_att * spatial_att  # [B, 1, H, W]
+        Weight = spectral_att * spatial_att  # [B, 1, H, W]
 
-        fused_feat = self.alpha * W * frm_feat + (1 - self.alpha) * (1 - W) * other_feat
+        fused_feat = self.alpha * Weight * frm_feat + (1 - self.alpha) * (1 - Weight) * other_feat
+
+        # ===== CP重构 =====
+        # U1_exp = U1.permute(0, 2, 1).unsqueeze(3).unsqueeze(4)  # [B, k, C, 1, 1]
+        # U2_exp = U2.permute(0, 2, 1).unsqueeze(2).unsqueeze(4)  # [B, k, 1, W, 1]
+        # U3_exp = U3.permute(0, 2, 1).unsqueeze(2).unsqueeze(3)  # [B, k, 1, 1, H]
+        #
+        # cp_recon = (U1_exp * U2_exp * U3_exp).sum(dim=1)  # [B, C, W, H]
+        # cp_recon = cp_recon.permute(0, 1, 3, 2)  # → [B, C, H, W]
+        # cp_recon = self.recon_conv(cp_recon)
+        # 生成每个通道自己的k分量
+        # U1_map = self.u1_conv(Fm).reshape(batch, C, self.k, H, W)
+        # U2_map = self.u2_conv(Fm).reshape(batch, C, self.k, H, W)
+        # U3_map = self.u3_conv(Fm).reshape(batch, C, self.k, H, W)
+        # # CP重构
+        # cp_recon = (U1_map * U2_map * U3_map).sum(dim=2)  # [B, C, H, W]
+        # cp_recon = (self.recon_conv(cp_recon)) * Weight  # [B, C, H, W]
+
+        # ===== 重建映射 =====
+        cp_recon = torch.einsum('bcr,bhr,bwr,r->bchw', U1, U2, U3, self.lambda_weight)
+        cp_recon = (self.recon_conv(cp_recon)) * Weight + Fm  # [B, C, H, W]
 
         return fused_feat, cp_recon
+
+class DenseFusionBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, growth_rate, 3, padding=1)
+        self.se1 = CBAMBlock(growth_rate)
+        self.conv2 = nn.Conv2d(in_channels + growth_rate, growth_rate, 3, padding=1)
+        self.se2 = CBAMBlock(growth_rate)
+        self.conv3 = nn.Conv2d(in_channels + 2 * growth_rate, out_channels, 3, padding=1)
+        self.se3 = CBAMBlock(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+    def forward(self, *inputs):
+        # inputs: [f1, f2, ...]
+        x = torch.cat(inputs, dim=1)
+        y1 = self.se1(self.relu(self.conv1(x)))
+        y2 = self.se2(self.relu(self.conv2(torch.cat([x, y1], dim=1))))
+        y3 = self.se3(self.relu(self.conv3(torch.cat([x, y1, y2], dim=1))))
+        return y3
+
+class CBAMBlock(nn.Module):
+    def __init__(self, ch, r=8):
+        super().__init__()
+        # 通道注意力
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(ch, ch // r, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Conv2d(ch // r, ch, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        # 空间注意力
+        self.conv_spatial = nn.Conv2d(2, 1, 7, padding=3)
+    def forward(self, x):
+        # 通道注意力
+        avg = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_ = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        ca = self.sigmoid(avg + max_)
+        x = x * ca
+        # 空间注意力
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        sa = self.sigmoid(self.conv_spatial(torch.cat([avg_out, max_out], dim=1)))
+        x = x * sa
+        return x
+
 
 class HSI_MSI_Fusion_UNet(nn.Module):
     """高光谱与多光谱图像融合U-Net网络（Hr-MSI下采样到Lr-HSI尺度）"""
@@ -237,35 +302,31 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         self.conv1 = nn.Conv2d(512, 64, 1)
         self.conv2 = nn.Conv2d(256, 64, 1)
         self.conv3 = nn.Conv2d(128, 64, 1)
-        self.fuse3 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.fuse2 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.fuse1 = nn.Sequential(
-            nn.Conv2d(64 * 2, 64, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.out = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
+        self.fuse3 = nn.Sequential(nn.Conv2d(64 * 2, 64, 3, padding=1), nn.ReLU(inplace=True))
+        self.fuse2 = nn.Sequential(nn.Conv2d(64 * 2, 64, 3, padding=1), nn.ReLU(inplace=True))
+        self.fuse1 = nn.Sequential(nn.Conv2d(64 * 2, 64, 3, padding=1), nn.ReLU(inplace=True))
+        self.out = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(inplace=True))
 
         # 输出层，将CP重构特征和融合特征映射到Hr-HSI的维度
-        self.cp_recon_mapping = nn.Sequential(
-            DoubleConv(64, 64),
-            OutConv(64, out_channels)
-        )
+        self.cp_recon_mapping = nn.Sequential(DoubleConv(64, 64), OutConv(64, out_channels))
 
-        self.fused_feat_mapping = nn.Sequential(
-            DoubleConv(64, 64),
-            OutConv(64, out_channels)
-
-        )
+        self.fused_feat_mapping = nn.Sequential(DoubleConv(64, 64), OutConv(64, out_channels))
         self.Sigmoid = nn.Sigmoid()
+
+        # 将所有特征都压到统一通道数
+        self.reduce1 = nn.Conv2d(512, 64, 1)
+        self.reduce2 = nn.Conv2d(256, 64, 1)
+        self.reduce3 = nn.Conv2d(128, 64, 1)
+        self.reduce4 = nn.Conv2d(64, 64, 1)
+        # Dense融合块
+        self.fusion = DenseFusionBlock(64 * 4, 64, 64)
+
+        # 空洞卷积模块
+        self.DCB1 = DilatedConvBlock(64, 3, [1, 2, 4])
+        self.DCB2 = DilatedConvBlock(64, 3, [1, 2, 4])
+        # 简单门控注意力U-Net
+        self.SCAUNet = SimpleUNet(64, 64)
+
 
     def forward(self, hr_msi, lr_hsi):
         # Hr-MSI分支的编码路径
@@ -281,15 +342,6 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         # 在hr_x4和Lr-HSI尺度应用FRM和MDRM模块
         frm_out_1 = self.frm1(hr_x4, lr_x)         # (1, 512, 30, 30)
         fused_feat_1, cp_recon_1 = self.mdrm1(frm_out_1, lr_x)     # (1, 512, 30, 30)
-        fused_feat_1 = self.Sigmoid(fused_feat_1)     # (1, 512, 30, 30)
-        hr_x3 = self.Sigmoid(hr_x3)  # (1, 256, 60, 60)
-
-        # =========================打印调试信息=================================
-        # print("fused_feat", fused_feat.shape)
-        # print("hr_x3", hr_x3.shape)
-        # print("hr_x2", hr_x2.shape)
-        # print("hr_x1", hr_x1.shape)
-        # =========================打印调试信息=================================
 
 
         # 解码器路径
@@ -297,23 +349,22 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         # 在hr_x3和x1应用FRM和MDRM模块
         frm_out_2 = self.frm2(hr_x3, x1)  # (1, 256, 60, 60)
         fused_feat_2, cp_recon_2 = self.mdrm2(frm_out_2, x1)     # (1, 256, 60, 60)
-        fused_feat_2 = self.Sigmoid(fused_feat_2)  # (1, 256, 60, 60)
+
 
         x2 = self.up2(fused_feat_2, hr_x2)   # (1, 128, 120, 120)
         # 在hr_x2和x2应用FRM和MDRM模块
         frm_out_3 = self.frm3(hr_x2, x2)       # (1, 128, 120, 120)
         fused_feat_3, cp_recon_3 = self.mdrm3(frm_out_3, x2)     # (1, 128, 120, 120)
-        fused_feat_3 = self.Sigmoid(fused_feat_3)  # (1, 128, 120, 120)
 
-        x3 = self.up3(fused_feat_3, hr_x1)
+        x3 = self.up3(fused_feat_3, hr_x1)   # (1, 64, 240, 240)
 
         # 在hr_x1和x3应用FRM和MDRM模块
         frm_out_4 = self.frm4(hr_x1, x3)       # (1, 64, 240, 240)
         fused_feat_4, cp_recon_4 = self.mdrm4(frm_out_4, x3)     # (1, 64, 240, 240)
-        fused_feat_4 = self.Sigmoid(fused_feat_4)  # (1, 64, 240, 240)
 
-        x = self.up4(fused_feat_4)
+        x = self.out(fused_feat_4)  # (1, 64, 240, 240)
 
+        """方案一："""
         y1 = self.conv1(cp_recon_1)      # cp_recon_1(1,512,30,30)---->y1(1, 64, 30, 30)
         y2 = self.conv2(cp_recon_2)      # cp_recon_2(1,256,60,60)---->y2(1, 64, 60, 60)
         y3 = self.conv3(cp_recon_3)      # cp_recon_3(1,128,120,120)----->y3(1, 64, 120, 120)
@@ -325,19 +376,18 @@ class HSI_MSI_Fusion_UNet(nn.Module):
 
         y4_up = F.interpolate(y3_fuse, size=cp_recon_4.shape[2:], mode='bilinear', align_corners=True)   # (1, 64, 240, 240)
         y4_fuse = self.fuse1(torch.cat([cp_recon_4, y4_up], dim=1)) + cp_recon_4      # (1, 64, 240, 240)
+        """方案一结束"""
 
-        y = self.out(y4_fuse)      # (1, 64, 240, 240)
-        # =========================打印调试信息=================================
-        # print("x1", x1.shape)
-        # print("x2", x2.shape)
-        # print("x3", x3.shape)
-        # print("x", x.shape)
-        # =========================打印调试信息=================================
-
-
+        y = self.out(y4_fuse)  # (1, 64, 240, 240)
+        x = self.DCB1(x)
+        # y = self.SCAUNet(y)
+        # x = self.SCAUNet(x)       # SCAUNet网络不行，要换
+        y = self.DCB2(y)
 
         # 将CP重构特征和融合特征映射到Hr-HSI的维度
-        mapped_cp_recon = self.cp_recon_mapping(y)    # (1,54,240,240)
-        mapped_fused_feat = self.fused_feat_mapping(x)
+        mapped_cp_recon = self.cp_recon_mapping(y)    # (1,C,H,W)  (1,46,240,240)
+        mapped_fused_feat = self.fused_feat_mapping(x)       # (1,C,H,W)
 
         return mapped_cp_recon, mapped_fused_feat
+
+
