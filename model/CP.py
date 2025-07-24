@@ -3,7 +3,7 @@
 from datetime import datetime
 
 """
-❗❗❗❗❗❗#此py作用：对应第三阶段的图像生成
+❗❗❗❗❗❗#此py作用：CP分解与重构
 """
 import torch
 import torch.nn as nn
@@ -299,6 +299,7 @@ class CP_model(nn.Module):
             opt_file.write(information_f)
 
         return flag_best_1[2], flag_best_2[2]
+
 
 if __name__ == "__main__":
     pass
