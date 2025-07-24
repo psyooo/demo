@@ -42,6 +42,7 @@ class CP_model(nn.Module):
 
 
         self.args = args
+        self.rank = self.args.Rank
 
         self.hr_msi = blind.tensor_hr_msi  # 四维
         self.lr_hsi = blind.tensor_lr_hsi  # 四维
@@ -58,7 +59,7 @@ class CP_model(nn.Module):
         self.noise1 = self.get_noise(self.gt.shape[2], (self.gt.shape[0], self.gt.shape[1])).to(self.args.device).float()
         self.noise2 = self.get_noise(self.gt.shape[2], (self.gt.shape[0], self.gt.shape[1])).to(self.args.device).float()
 
-        self.net = HSI_MSI_Fusion_UNet(args,hr_msi.shape[1],lr_hsi.shape[1],lr_hsi.shape[1],bilinear=True,k=5).to(self.args.device)
+        self.net = HSI_MSI_Fusion_UNet(args, hr_msi.shape[1], lr_hsi.shape[1], lr_hsi.shape[1], bilinear=True, k=self.rank).to(self.args.device)
 
         def lambda_rule(epoch):
             lr_l = 1.0 - max(0, epoch + 1 - self.args.niter2_UNet) / float(self.args.niter_decay2_UNet + 1)
@@ -116,10 +117,6 @@ class CP_model(nn.Module):
 
             self.cp_recon, self.fused_feat = self.net(self.hr_msi, self.lr_hsi)
 
-
-            if self.fused_feat.shape[2:] != self.hr_msi.shape[2:]:
-                self.fused_feat = fun.interpolate(self.fused_feat, size=self.hr_msi.shape[2:], mode='bilinear',align_corners=True)
-
             ''' generate hr_msi_est '''
             # print(self.hrhsi_est.shape)
             self.hr_msi_fCP = self.srf_down(self.cp_recon, self.srf_est)  # 光谱退化
@@ -164,8 +161,7 @@ class CP_model(nn.Module):
                     ''' for ftrans'''
 
                     # 学习到的lrhsi与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_numpy, lr_hsi_est_fCP_numpy,
-                                                                       self.args.scale_factor)
+                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_numpy, lr_hsi_est_fCP_numpy, self.args.scale_factor)
                     L1 = np.mean(np.abs(lr_hsi_numpy - lr_hsi_est_fCP_numpy))
                     information1 = "生成lrhsi_fCP与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
                     print(information1)  # 监控训练过程
@@ -304,9 +300,5 @@ class CP_model(nn.Module):
 
         return flag_best_1[2], flag_best_2[2]
 
-
 if __name__ == "__main__":
     pass
-
-
-
