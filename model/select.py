@@ -12,6 +12,8 @@ from datetime import datetime
 import torch.nn.functional as F
 import torch.nn as nn
 from torchmetrics.functional import structural_similarity_index_measure as ssim
+from visualizer import UnifiedVisualizer
+
 def spatial_spectral_total_variation(image, spatial_weight=0.5, spectral_weight=0.5):
     """
     计算空间光谱总变分 (SSTV)
@@ -222,7 +224,7 @@ def select_decision(Out_fhsi,Out_fmsi,blind): #Out_fhsi,Out_fmsi是四维device 
         opt_file.write("Iteration\tTotal Loss\tSAM Loss\tSSIM Loss\tL1 Loss\tSSTV Loss\n")
 
     # 迭代优化
-    num_iterations = 4001
+    num_iterations = 1000
     # 使用新的自适应融合方法
     fused_result, weight_map = adaptive_feature_fusion(
         Out_fhsi,
@@ -234,7 +236,7 @@ def select_decision(Out_fhsi,Out_fmsi,blind): #Out_fhsi,Out_fmsi是四维device 
     # 将初始结果作为起点
     current_result = fused_result.detach()
     # 记录当前迭代的TV损失
-    for i in range(num_iterations):
+    for i in range(1,num_iterations+1):
         # 创建新的可训练参数
         optimized_result = nn.Parameter(current_result.clone())
         # 定义优化器（每次迭代重新创建）
@@ -296,10 +298,23 @@ def select_decision(Out_fhsi,Out_fmsi,blind): #Out_fhsi,Out_fmsi是四维device 
     # 保存决策结果
     sio.savemat(os.path.join(blind.args.expr_dir, 'srf_Out_S4.mat'), {'Out': srf_out})
 
+
     # 保存权重图用于分析
     if hasattr(blind.args, 'save_weight_map') and blind.args.save_weight_map:
         weight_np = current_weight_map.data.cpu().numpy()[0, 0]  # [H, W]
         sio.savemat(os.path.join(blind.args.expr_dir, 'fusion_weight.mat'), {'weight': weight_np})
+
+    # 关键：使用与训练过程相同的环境名称，确保在同一网页显示
+    visualizer = UnifiedVisualizer(env_name="Model_Visualization", save_dir="./final_visualizations")
+
+    # 可视化最终结果
+    metrics = visualizer.visualize_final_results(
+        pred_img=srf_out,
+        gt_img=gt,
+        img_name="best_model",
+        bands=[45, 29, 13],
+        title_suffix="(Best Model Selection)"
+    )
 
     return srf_out
 
@@ -366,5 +381,4 @@ def compute_sam_loss(pred, target):
 
     # 计算平均SAM损失
     return torch.mean(sam)
-
 
