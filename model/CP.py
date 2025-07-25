@@ -16,7 +16,11 @@ import torch.nn.functional as fun
 
 from .evaluation import MetricsCal
 from .CP_network import HSI_MSI_Fusion_UNet
+from .visualizer import UnifiedVisualizer
+import logging
 
+# 配置日志
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 ''' PSF and SRF 下采样'''
 class PSF_down():
     def __call__(self, input_tensor, psf, ratio):
@@ -37,13 +41,20 @@ class SRF_down():
 
 
 class CP_model(nn.Module):
-    def __init__(self, args, hr_msi, lr_hsi, psf, srf, blind):
+    def __init__(self, args, hr_msi, lr_hsi, psf, srf, blind, vis):
         super().__init__()
-
 
         self.args = args
         self.rank = self.args.Rank
+        # 初始化统一可视化工具，指定环境名称
+        if vis is None:
+            self.visualizer = UnifiedVisualizer(env_name="Model_Visualization")
+        else:
+            self.visualizer = vis  # 允许外部传入共享的可视化实例
 
+        self.hr_msi = hr_msi  # 四维
+        self.lr_hsi = lr_hsi  # 四维
+        self.gt = blind.gt  # 三维
         self.hr_msi = blind.tensor_hr_msi  # 四维
         self.lr_hsi = blind.tensor_lr_hsi  # 四维
         self.gt = blind.gt  # 三维
@@ -117,20 +128,18 @@ class CP_model(nn.Module):
 
             self.cp_recon, self.fused_feat = self.net(self.hr_msi, self.lr_hsi)
 
-            ''' generate hr_msi_est '''
-            # print(self.hrhsi_est.shape)
+            ''' 生成估计的hr_msi '''
             self.hr_msi_fCP = self.srf_down(self.cp_recon, self.srf_est)  # 光谱退化
             self.hr_msi_fused = self.srf_down(self.fused_feat, self.srf_est)
 
-            ''' generate lr_hsi_est '''
+            ''' 生成估计的lr_hsi '''
             self.lr_hsi_fCP = self.psf_down(self.cp_recon, self.psf_est, self.args.scale_factor)  # 空间退化
             self.lr_hsi_fused = self.psf_down(self.fused_feat, self.psf_est, self.args.scale_factor)
 
-            # Y--->lr_hsi，Z--->hr_msi
             # 融合图像空间退化--->lr_hsi_fCP，融合图像光谱退化--->hr_msi_fused
-            loss_fhsi = L1Loss(self.hr_msi, self.hr_msi_fCP) + L1Loss(self.lr_hsi,self.lr_hsi_fCP)  # 空间退化+光谱退化
-            loss_fmsi = L1Loss(self.hr_msi, self.hr_msi_fused) + L1Loss(self.lr_hsi, self.lr_hsi_fused)
-            loss = loss_fhsi + loss_fmsi
+            loss_CP = L1Loss(self.hr_msi, self.hr_msi_fCP) + L1Loss(self.lr_hsi,self.lr_hsi_fCP)  # 空间退化+光谱退化
+            loss_fused = L1Loss(self.hr_msi, self.hr_msi_fused) + L1Loss(self.lr_hsi, self.lr_hsi_fused)
+            loss = loss_CP + loss_fused
 
             loss.backward()
             self.optimizer.step()
@@ -144,40 +153,42 @@ class CP_model(nn.Module):
 
                     # 转为W H C的numpy 方便计算指标
                     # hrmsi
-                    hr_msi_numpy = self.hr_msi.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
-                    hr_msi_est_fCP_numpy = self.hr_msi_fCP.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
-                    hr_msi_est_fused_numpy = self.hr_msi_fused.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    hr_msi_np = self.hr_msi.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    hr_msi_fCP_np = self.hr_msi_fCP.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    hr_msi_fused_np = self.hr_msi_fused.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
 
                     # lrhsi
-                    lr_hsi_numpy = self.lr_hsi.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
-                    lr_hsi_est_fCP_numpy = self.lr_hsi_fCP.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
-                    lr_hsi_est_fused_numpy = self.lr_hsi_fused.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    lr_hsi_np = self.lr_hsi.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    lr_hsi_fCP_np = self.lr_hsi_fCP.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    lr_hsi_fused_np = self.lr_hsi_fused.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
 
                     # hrhsi
-                    hrhsi_est_numpy_ftrans = self.cp_recon.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
-                    hrhsi_est_numpy_funet = self.fused_feat.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    hrhsi_est_fCP = self.cp_recon.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                    hrhsi_est_fused = self.fused_feat.data.cpu().detach().numpy()[0].transpose(1, 2, 0)
 
+                    # 计算指标
+                    current_lr = self.optimizer.param_groups[0]['lr']
 
                     ''' for ftrans'''
 
                     # 学习到的lrhsi与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_numpy, lr_hsi_est_fCP_numpy, self.args.scale_factor)
-                    L1 = np.mean(np.abs(lr_hsi_numpy - lr_hsi_est_fCP_numpy))
+                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_np, lr_hsi_fCP_np, self.args.scale_factor)
+                    L1 = np.mean(np.abs(lr_hsi_np - lr_hsi_fCP_np))
                     information1 = "生成lrhsi_fCP与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
                     print(information1)  # 监控训练过程
                     print('************')
 
                     # 学习到的hrmsi与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(hr_msi_numpy, hr_msi_est_fCP_numpy,self.args.scale_factor)
-                    L1 = np.mean(np.abs(hr_msi_numpy - hr_msi_est_fCP_numpy))
+                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(hr_msi_np, hr_msi_fCP_np,self.args.scale_factor)
+                    L1 = np.mean(np.abs(hr_msi_np - hr_msi_fCP_np))
                     information2 = "生成hrmsi_fCP与目标hrmsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
                     print(information2)  # 监控训练过程
                     print('************')
 
                     # 学习到的gt与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(self.gt, hrhsi_est_numpy_ftrans,self.args.scale_factor)
-                    L1 = np.mean(np.abs(self.gt - hrhsi_est_numpy_ftrans))
-                    information3 = "生成hrhsi_est_fcp与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
+                    sam_fCP, psnr_fCP, ergas, cc, rmse, Ssim, Uqi = MetricsCal(self.gt, hrhsi_est_fCP,self.args.scale_factor)
+                    L1 = np.mean(np.abs(self.gt - hrhsi_est_fCP))
+                    information3 = "生成hrhsi_est_fcp与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam_fCP, psnr_fCP, ergas, cc, rmse, Ssim, Uqi)
                     print(information3)  # 监控训练过程
                     print('************')
 
@@ -210,23 +221,23 @@ class CP_model(nn.Module):
 
                     ''' for funet'''
                     # 学习到的lrhsi与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_numpy, lr_hsi_est_fused_numpy,self.args.scale_factor)
-                    L1 = np.mean(np.abs(lr_hsi_numpy - lr_hsi_est_fused_numpy))
+                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(lr_hsi_np, lr_hsi_fused_np,self.args.scale_factor)
+                    L1 = np.mean(np.abs(lr_hsi_np - lr_hsi_fused_np))
                     information1 = "生成lrhsi_fused与目标lrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
                     print(information1)  # 监控训练过程
                     print('************')
 
                     # 学习到的hrmsi与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(hr_msi_numpy, hr_msi_est_fused_numpy,self.args.scale_factor)
-                    L1 = np.mean(np.abs(hr_msi_numpy - hr_msi_est_fused_numpy))
+                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(hr_msi_np, hr_msi_fused_np,self.args.scale_factor)
+                    L1 = np.mean(np.abs(hr_msi_np - hr_msi_fused_np))
                     information2 = "生成hrmsi_fused与目标hrmsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
                     print(information2)  # 监控训练过程
                     print('************')
 
                     # 学习到的gt与真值
-                    sam, psnr, ergas, cc, rmse, Ssim, Uqi = MetricsCal(self.gt, hrhsi_est_numpy_funet,self.args.scale_factor)
-                    L1 = np.mean(np.abs(self.gt - hrhsi_est_numpy_funet))
-                    information3 = "生成hrhsi_est_fused与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam, psnr, ergas, cc, rmse, Ssim, Uqi)
+                    sam_fused, psnr_fused, ergas, cc, rmse, Ssim, Uqi = MetricsCal(self.gt, hrhsi_est_fused,self.args.scale_factor)
+                    L1 = np.mean(np.abs(self.gt - hrhsi_est_fused))
+                    information3 = "生成hrhsi_est_fused与目标hrhsi\n L1 {} sam {},psnr {},ergas {},cc {},rmse {},Ssim {},Uqi {}".format(L1, sam_fused, psnr_fused, ergas, cc, rmse, Ssim, Uqi)
                     print(information3)  # 监控训练过程
                     print('************')
 
@@ -257,6 +268,24 @@ class CP_model(nn.Module):
                         information_e = information2
                         information_f = information3
                     ''' for fmsi'''
+
+                    # 使用可视化工具类更新所有可视化内容
+                    self.visualizer.update_losses(epoch, loss.item(), loss_CP.item(), loss_fused.item())
+                    self.visualizer.update_metrics('fCP', epoch, psnr_fCP, sam_fCP)
+                    self.visualizer.update_metrics('fused', epoch, psnr_fused, sam_fused)
+                    self.visualizer.update_learning_rate(epoch, current_lr)
+                    self.visualizer.update_reconstructions('fCP', epoch, hrhsi_est_fCP)
+                    self.visualizer.update_reconstructions('fused', epoch, hrhsi_est_fused)
+                    self.visualizer.update_hrmsi(epoch, hr_msi_fCP_np, hr_msi_fused_np)
+                    self.visualizer.update_lrhsi(epoch, lr_hsi_fCP_np, lr_hsi_fused_np)
+
+                    # 光谱曲线对比
+                    h, w = hrhsi_est_fCP.shape[:2]
+                    x, y = np.random.randint(0, h), np.random.randint(0, w)
+                    gt_curve = self.gt[x, y, :]
+                    fCP_curve = hrhsi_est_fCP[x, y, :]
+                    fused_curve = hrhsi_est_fused[x, y, :]
+                    self.visualizer.update_spectral_curve(epoch, gt_curve, fCP_curve, fused_curve)
 
         # 保存最好的结果
         # scipy.io.savemat(os.path.join(self.args.expr_dir, 'Out_fhsi_S3.mat'), {'Out':flag_best_1[2].data.cpu().numpy()[0].transpose(1,2,0)})
