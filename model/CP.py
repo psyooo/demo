@@ -15,7 +15,7 @@ import scipy
 import torch.nn.functional as fun
 
 from .evaluation import MetricsCal
-from .CP_network import HSI_MSI_Fusion_UNet
+from .CP_network1 import HSI_MSI_Fusion_UNet
 from .visualizer import UnifiedVisualizer
 import logging
 
@@ -58,6 +58,7 @@ class CP_model(nn.Module):
         self.hr_msi = blind.tensor_hr_msi  # 四维
         self.lr_hsi = blind.tensor_lr_hsi  # 四维
         self.gt = blind.gt  # 三维
+        self.gt_tensor = blind.tensor_gt  # 三维
 
         psf_est = np.reshape(psf, newshape=(1, 1, self.args.scale_factor, self.args.scale_factor))  # 1 1 ratio ratio 大小的tensor
         self.psf_est = torch.tensor(psf_est).to(self.args.device).float()
@@ -136,9 +137,12 @@ class CP_model(nn.Module):
             self.lr_hsi_fCP = self.psf_down(self.cp_recon, self.psf_est, self.args.scale_factor)  # 空间退化
             self.lr_hsi_fused = self.psf_down(self.fused_feat, self.psf_est, self.args.scale_factor)
 
+
             # 融合图像空间退化--->lr_hsi_fCP，融合图像光谱退化--->hr_msi_fused
             loss_CP = L1Loss(self.hr_msi, self.hr_msi_fCP) + L1Loss(self.lr_hsi,self.lr_hsi_fCP)  # 空间退化+光谱退化
-            loss_fused = L1Loss(self.hr_msi, self.hr_msi_fused) + L1Loss(self.lr_hsi, self.lr_hsi_fused)
+            loss_fused = L1Loss(self.hr_msi, self.hr_msi_fused) + L1Loss(self.lr_hsi, self.lr_hsi_fused)  # 融合特征图
+            # loss_join = L1Loss(self.gt_tensor, self.cp_recon) + L1Loss(self.gt_tensor, self.fused_feat)  # 融合特征图
+            # loss = loss_CP + loss_fused + loss_join
             loss = loss_CP + loss_fused
 
             loss.backward()
@@ -332,3 +336,6 @@ class CP_model(nn.Module):
 
 if __name__ == "__main__":
     pass
+
+
+
