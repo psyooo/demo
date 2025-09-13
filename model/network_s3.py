@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-❗❗❗❗❗❗#此py作用：第三阶段所需要的网络模块
+❗❗❗❗❗❗#此py作用：所需要的网络模块
 """
 import torch
 from torch.nn import init
