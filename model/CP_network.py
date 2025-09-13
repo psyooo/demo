@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .network_s3_1 import DilatedConvBlock, SimpleUNet
+from .network_s3 import DilatedConvBlock, SimpleUNet
 
 
 class DoubleConv(nn.Module):
@@ -489,5 +489,6 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         mapped_fused_feat = self.fused_feat_mapping(x)       # (1,C,H,W)
 
         return mapped_cp_recon, mapped_fused_feat
+
 
 
