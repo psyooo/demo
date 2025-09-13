@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-❗❗❗❗❗❗李嘉鑫 作者微信 BatAug
-空天信息创新研究院20-25直博生，导师高连如
-
-"""
-
-
-"""
 ❗❗第一阶段：SRF和PSF的生成
 #此py作用：估计PSF和SRF 同时生成Lrmsi
 """
@@ -275,4 +268,5 @@ class Blind(readdata):
             w.mul_(srf_div)
             
 if __name__ == "__main__":
+
     pass
