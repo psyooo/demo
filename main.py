@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 """
 ❗❗❗❗❗❗#主文件
 """
@@ -12,6 +11,7 @@ import random
 from model.config import args
 import matplotlib.pyplot as plt
 import visdom
+from model.visualizer import UnifiedVisualizer  # 新增
 #设置随机种子
 def setup_seed(seed):
    torch.manual_seed(seed)
@@ -21,6 +21,13 @@ def setup_seed(seed):
    torch.backends.cudnn.deterministic = True
 
 setup_seed(args.seed)
+
+# 新增：初始化可视化工具
+vis = UnifiedVisualizer(
+    env_name=f"{args.data_name}_visualization",
+    save_dir=os.path.join(args.expr_dir, "visualizations")  # 保存到结果目录
+)  # 新增
+
 
 '''第一阶段'''
 from model.srf_psf_layer import Blind       #将退化函数看作一层的参数
@@ -44,7 +51,6 @@ elapsed_S1 = end - start        # 计算经过的时间（单位为秒）
 
 '''第二阶段'''
 
-
 from model.CP import CP_model
 CP=CP_model(args,blind.tensor_hr_msi,blind.tensor_lr_hsi,psf_gt,srf_gt,blind,vis)
 # print(CP.net)
@@ -58,7 +64,8 @@ elapsed_S2 = end - start        # 计算经过的时间（单位为秒）
 from model.select import select_decision
 # from model.fusion import select_decision
 start = time.perf_counter() # 记录开始时间
-srf_out=select_decision(hr_hsi1,hr_hsi2,blind) #返回的是3维H W C numpy 这个就是最终的结果
+
+srf_out=select_decision(hr_hsi1, hr_hsi2, blind, vis) #返回的是3维H W C numpy 这个就是最终的结果
 # srf_out=Fusion.train() # 返回的是3维H W C numpy 这个就是最终的结果
 
 end = time.perf_counter()   # 记录结束时间
