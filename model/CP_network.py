@@ -25,6 +25,7 @@ class DoubleConv(nn.Module):
         return self.double_conv(x)
 
 
+
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
 
@@ -83,13 +84,14 @@ class FRM(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.leaky_relu = nn.LeakyReLU(inplace=False)
 
-    def forward(self, x, skip_x):
+    def forward(self, x, skip_x, map):
         # x, skip_x: [B, C, H, W]，空间可能不一致
         if x.shape[2:] != skip_x.shape[2:]:
             x = F.interpolate(x, size=skip_x.shape[2:], mode='bilinear', align_corners=True)
         concat_feat = torch.cat([x, skip_x], dim=1)
-        out = self.leaky_relu(self.conv1(concat_feat))
-        out = self.leaky_relu(self.conv2(out))
+
+        out = self.leaky_relu(self.conv1(concat_feat) * map)
+        out = self.leaky_relu(self.conv2(out)+x)
         return out
 
 
@@ -131,6 +133,19 @@ class MDRMWithCPRecon(nn.Module):
 
         self.leaky_relu = nn.LeakyReLU(inplace=False)
         self.sigmoid = nn.Sigmoid()
+
+    def _compute_group_sparsity(self, U1, U2, U3):
+        """
+        U1: [B, C, k], U2: [B, H, k], U3: [B, W, k]
+        返回 L2,1 组稀疏正则：
+        sum_r sqrt( ||U1[:,:,r]||_F^2 + ||U2[:,:,r]||_F^2 + ||U3[:,:,r]||_F^2 )
+        """
+        # 对 batch 维与特征维做 Frobenius，再对秩维聚合
+        U1_f = torch.linalg.norm(U1, ord='fro', dim=(0, 1))  # [k]
+        U2_f = torch.linalg.norm(U2, ord='fro', dim=(0, 1))  # [k]
+        U3_f = torch.linalg.norm(U3, ord='fro', dim=(0, 1))  # [k]
+        group = torch.sqrt(U1_f ** 2 + U2_f ** 2 + U3_f ** 2 + 1e-12)  # [k]
+        return group.sum()
 
     def forward(self, frm_feat, other_feat):
         batch, C, H, W = frm_feat.shape
@@ -193,25 +208,15 @@ class MDRMWithCPRecon(nn.Module):
 
         fused_feat = self.alpha * Weight * frm_feat + (1 - self.alpha) * (1 - Weight) * other_feat
 
-        # ===== CP重构 =====
-        # U1_exp = U1.permute(0, 2, 1).unsqueeze(3).unsqueeze(4)  # [B, k, C, 1, 1]
-        # U2_exp = U2.permute(0, 2, 1).unsqueeze(2).unsqueeze(4)  # [B, k, 1, W, 1]
-        # U3_exp = U3.permute(0, 2, 1).unsqueeze(2).unsqueeze(3)  # [B, k, 1, 1, H]
-        #
-        # cp_recon = (U1_exp * U2_exp * U3_exp).sum(dim=1)  # [B, C, W, H]
-        # cp_recon = cp_recon.permute(0, 1, 3, 2)  # → [B, C, H, W]
-        # cp_recon = self.recon_conv(cp_recon)
-        # 生成每个通道自己的k分量
-        # U1_map = self.u1_conv(Fm).reshape(batch, C, self.k, H, W)
-        # U2_map = self.u2_conv(Fm).reshape(batch, C, self.k, H, W)
-        # U3_map = self.u3_conv(Fm).reshape(batch, C, self.k, H, W)
-        # # CP重构
-        # cp_recon = (U1_map * U2_map * U3_map).sum(dim=2)  # [B, C, H, W]
-        # cp_recon = (self.recon_conv(cp_recon)) * Weight  # [B, C, H, W]
+
 
         # ===== 重建映射 =====
         cp_recon = torch.einsum('bcr,bhr,bwr,r->bchw', U1, U2, U3, self.lambda_weight)
         cp_recon = (self.recon_conv(cp_recon)) * Weight + Fm  # [B, C, H, W]
+
+        # self.reg_l21, energy_vec= self._compute_group_sparsity(U1, U2, U3)  # L2,1 组稀疏
+        # self.reg_l1_lambda = torch.norm(self.lambda_weight, p=1)  # λ 的 L1 稀疏
+        # self.rank_energy = energy_vec.detach()  # [k] 供外部剪枝参考
 
         return fused_feat, cp_recon
 
@@ -257,6 +262,70 @@ class CBAMBlock(nn.Module):
         sa = self.sigmoid(self.conv_spatial(torch.cat([avg_out, max_out], dim=1)))
         x = x * sa
         return x
+
+class spa_attn(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.conv2 = nn.Conv2d(in_channels * 2, out_channels, 1)
+        self.conv3 = nn.Conv2d(out_channels, 1, 3, padding=1)
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU(inplace=True)
+        self.norm = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        avg_out = self.avg_pool(x)
+        max_out = self.max_pool(x)
+        cat_out = torch.cat([avg_out, max_out], dim=1)
+        cat_out = self.conv2(cat_out)
+        cat_out = self.relu(cat_out).expand(-1, -1, x.size(2), x.size(3))
+        # cat_out = self.norm(cat_out)
+        attn_out = self.sigmoid(self.conv3(cat_out))
+        # x = x * attn_out
+
+        return attn_out
+
+class spe_attn(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        # 通道压缩比
+        mid_channels = max(in_channels // reduction, 4)
+        # 分支1：AvgPool
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Sequential(
+            nn.Linear(in_channels, mid_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_channels, in_channels, bias=False)
+        )
+        # 分支2：MaxPool
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc2 = nn.Sequential(
+            nn.Linear(in_channels, mid_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_channels, in_channels, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        # AvgPool分支
+        avg = self.avg_pool(x).view(B, C)
+        avg_out = self.fc1(avg)
+        # MaxPool分支
+        maxp = self.max_pool(x).view(B, C)
+        max_out = self.fc2(maxp)
+        # 相加融合
+        out = avg_out + max_out
+        scale = self.sigmoid(out).view(B, C, 1, 1)
+        return scale
+
+
+
+
+
 
 
 class HSI_MSI_Fusion_UNet(nn.Module):
@@ -327,6 +396,19 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         # 简单门控注意力U-Net
         self.SCAUNet = SimpleUNet(64, 64)
 
+        self.spa_attn1 = spa_attn(512, 512)
+        self.spa_attn2 = spa_attn(256, 256)
+        self.spa_attn3 = spa_attn(128, 128)
+        self.spa_attn4 = spa_attn(64, 64)
+
+        self.spe_attn1 = spe_attn(512)
+        self.spe_attn2 = spe_attn(256)
+        self.spe_attn3 = spe_attn(128)
+        self.spe_attn4 = spe_attn(64)
+
+
+
+
 
     def forward(self, hr_msi, lr_hsi):
         # Hr-MSI分支的编码路径
@@ -335,31 +417,49 @@ class HSI_MSI_Fusion_UNet(nn.Module):
         hr_x3 = self.hr_down2(hr_x2)  # (1, 256, 60, 60)
         hr_x4 = self.hr_down3(hr_x3)  # (1, 512, 30, 30)
 
+        # 在hrmsi分支的每个下采样层后，应用空间注意力模块
+        hr_x4_att_map = self.spa_attn1(hr_x4)
+        hr_x3_att_map = self.spa_attn2(hr_x3)
+        hr_x2_att_map = self.spa_attn3(hr_x2)
+        hr_x1_att_map = self.spa_attn4(hr_x1)
 
         # Lr-HSI分支（调整通道数匹配hr_x4）
         lr_x = self.lr_inc(lr_hsi)  # (1, 512, 30, 30)
+        lr_x_map = self.spe_attn1(lr_x)
+        map_1 = self.Sigmoid(hr_x4_att_map * lr_x_map)
+        map_1 = F.interpolate(map_1, size=lr_x.shape[2:], mode='bilinear', align_corners=True)
+
 
         # 在hr_x4和Lr-HSI尺度应用FRM和MDRM模块
-        frm_out_1 = self.frm1(hr_x4, lr_x)         # (1, 512, 30, 30)
+        frm_out_1 = self.frm1(hr_x4, lr_x, map_1)         # (1, 512, 30, 30)
         fused_feat_1, cp_recon_1 = self.mdrm1(frm_out_1, lr_x)     # (1, 512, 30, 30)
 
 
         # 解码器路径
         x1 = self.up1(fused_feat_1, hr_x3)  # (1, 256, 60, 60)
+        x1_map = self.spe_attn2(x1)
+        map_2 = self.Sigmoid(hr_x3_att_map * x1_map)
+        map_2 = F.interpolate(map_2, size=x1.shape[2:], mode='bilinear', align_corners=True)
         # 在hr_x3和x1应用FRM和MDRM模块
-        frm_out_2 = self.frm2(hr_x3, x1)  # (1, 256, 60, 60)
+        frm_out_2 = self.frm2(hr_x3, x1, map_2)  # (1, 256, 60, 60)
         fused_feat_2, cp_recon_2 = self.mdrm2(frm_out_2, x1)     # (1, 256, 60, 60)
 
 
         x2 = self.up2(fused_feat_2, hr_x2)   # (1, 128, 120, 120)
+        x2_map = self.spe_attn3(x2)
+        map_3 = self.Sigmoid(hr_x2_att_map * x2_map)
+        map_3 = F.interpolate(map_3, size=x2.shape[2:], mode='bilinear', align_corners=True)
         # 在hr_x2和x2应用FRM和MDRM模块
-        frm_out_3 = self.frm3(hr_x2, x2)       # (1, 128, 120, 120)
+        frm_out_3 = self.frm3(hr_x2, x2, map_3)       # (1, 128, 120, 120)
         fused_feat_3, cp_recon_3 = self.mdrm3(frm_out_3, x2)     # (1, 128, 120, 120)
 
         x3 = self.up3(fused_feat_3, hr_x1)   # (1, 64, 240, 240)
+        x3_map = self.spe_attn4(x3)
+        map_4 = self.Sigmoid(hr_x1_att_map * x3_map)
+        map_4 = F.interpolate(map_4, size=x3.shape[2:], mode='bilinear', align_corners=True)
 
         # 在hr_x1和x3应用FRM和MDRM模块
-        frm_out_4 = self.frm4(hr_x1, x3)       # (1, 64, 240, 240)
+        frm_out_4 = self.frm4(hr_x1, x3, map_4)       # (1, 64, 240, 240)
         fused_feat_4, cp_recon_4 = self.mdrm4(frm_out_4, x3)     # (1, 64, 240, 240)
 
         x = self.out(fused_feat_4)  # (1, 64, 240, 240)
