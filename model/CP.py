@@ -141,8 +141,7 @@ class CP_model(nn.Module):
             # 融合图像空间退化--->lr_hsi_fCP，融合图像光谱退化--->hr_msi_fused
             loss_CP = L1Loss(self.hr_msi, self.hr_msi_fCP) + L1Loss(self.lr_hsi,self.lr_hsi_fCP)  # 空间退化+光谱退化
             loss_fused = L1Loss(self.hr_msi, self.hr_msi_fused) + L1Loss(self.lr_hsi, self.lr_hsi_fused)  # 融合特征图
-            # loss_join = L1Loss(self.gt_tensor, self.cp_recon) + L1Loss(self.gt_tensor, self.fused_feat)  # 融合特征图
-            # loss = loss_CP + loss_fused + loss_join
+
             loss = loss_CP + loss_fused
 
             loss.backward()
@@ -259,7 +258,7 @@ class CP_model(nn.Module):
                         opt_file.write('\n')
                         opt_file.write(information3)
                         opt_file.write('\n')
-                        # opt_file.write('————————————————————————————————')
+                        opt_file.write('————————————————————————————————')
                     # print(type(flag_best_1[2]))
                     # print(flag_best_1[2])
                     if sam < flag_best_2[0] and psnr > flag_best_2[1]:
